@@ -1430,7 +1430,7 @@ match_command = "^make\\b"
             "pnpm-build",
             "poetry-install",
             "pre-commit",
-            "ps-aux",
+            "ps",
             "quarto-render",
             "rsync",
             "shellcheck",
