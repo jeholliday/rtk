@@ -1408,29 +1408,44 @@ match_command = "^make\\b"
 
         let expected = [
             "ansible-playbook",
+            "brew-install",
+            "composer-install",
+            "df",
             "docker-compose-ps",
             "docker-inspect",
+            "dotnet-build",
             "du",
             "fail2ban-client",
             "gcloud",
+            "hadolint",
             "helm",
             "iptables",
             "make",
+            "markdownlint",
             "mix-compile",
             "mix-format",
             "mvn-build",
+            "ping",
             "pio-run",
             "pnpm-build",
+            "poetry-install",
             "pre-commit",
+            "ps-aux",
             "quarto-render",
+            "rsync",
+            "shellcheck",
             "shopify-theme",
             "sops",
+            "swift-build",
+            "systemctl-status",
             "terraform-plan",
             "tofu-fmt",
             "tofu-init",
             "tofu-plan",
             "tofu-validate",
             "trunk-build",
+            "uv-sync",
+            "yamllint",
         ];
 
         for name in &expected {
@@ -1449,8 +1464,8 @@ match_command = "^make\\b"
         let filters = make_filters(BUILTIN_TOML);
         assert_eq!(
             filters.len(),
-            24,
-            "Expected exactly 24 built-in filters, got {}. \
+            39,
+            "Expected exactly 39 built-in filters, got {}. \
              Update this count when adding/removing filters in src/filters/.",
             filters.len()
         );
@@ -1507,11 +1522,11 @@ expected = "output line 1\noutput line 2"
         let combined = format!("{}\n\n{}", BUILTIN_TOML, new_filter);
         let filters = make_filters(&combined);
 
-        // All 24 existing filters still present + 1 new = 25
+        // All 39 existing filters still present + 1 new = 40
         assert_eq!(
             filters.len(),
-            25,
-            "Expected 25 filters after concat (24 built-in + 1 new)"
+            40,
+            "Expected 40 filters after concat (39 built-in + 1 new)"
         );
 
         // New filter is discoverable
