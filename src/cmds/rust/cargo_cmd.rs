@@ -224,7 +224,7 @@ impl BlockHandler for CargoTestHandler {
 
     fn format_summary(&self, _exit_code: i32, raw: &str) -> Option<String> {
         if self.summary_lines.is_empty() && self.has_compile_errors {
-            let build_filtered = filter_cargo_build(raw);
+            let build_filtered = filter_cargo_build(raw, 0);
             if build_filtered.starts_with("cargo build:") {
                 return Some(format!(
                     "{}\n",
@@ -357,7 +357,9 @@ fn run_test(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 fn run_clippy(args: &[String], verbose: u8) -> Result<i32> {
-    run_cargo_filtered("clippy", args, verbose, filter_cargo_clippy)
+    run_cargo_filtered("clippy", args, verbose, move |raw| {
+        filter_cargo_clippy(raw, verbose)
+    })
 }
 
 fn run_check(args: &[String], verbose: u8) -> Result<i32> {
@@ -370,7 +372,9 @@ fn run_check(args: &[String], verbose: u8) -> Result<i32> {
 }
 
 fn run_install(args: &[String], verbose: u8) -> Result<i32> {
-    run_cargo_filtered("install", args, verbose, filter_cargo_install)
+    run_cargo_filtered("install", args, verbose, move |raw| {
+        filter_cargo_install(raw, verbose)
+    })
 }
 
 fn run_nextest(args: &[String], verbose: u8) -> Result<i32> {
@@ -389,7 +393,7 @@ fn format_crate_info(name: &str, version: &str, fallback: &str) -> String {
 }
 
 /// Filter cargo install output - strip dep compilation, keep installed/replaced/errors
-fn filter_cargo_install(output: &str) -> String {
+fn filter_cargo_install(output: &str, verbose: u8) -> String {
     let mut errors: Vec<String> = Vec::new();
     let mut error_count = 0;
     let mut compiled = 0;
@@ -530,7 +534,8 @@ fn filter_cargo_install(output: &str) -> String {
         }
         result.push_str("═══════════════════════════════════════\n");
 
-        for (i, err) in errors.iter().enumerate().take(15) {
+        let max_errors = if verbose > 0 { usize::MAX } else { 15 };
+        for (i, err) in errors.iter().enumerate().take(max_errors) {
             result.push_str(err);
             result.push('\n');
             if i < errors.len() - 1 {
@@ -538,8 +543,11 @@ fn filter_cargo_install(output: &str) -> String {
             }
         }
 
-        if errors.len() > 15 {
-            result.push_str(&format!("\n... +{} more issues\n", errors.len() - 15));
+        if errors.len() > max_errors {
+            result.push_str(&format!(
+                "\n... +{} more issues\n",
+                errors.len() - max_errors
+            ));
         }
 
         return result.trim().to_string();
@@ -789,7 +797,7 @@ fn filter_cargo_nextest(output: &str) -> String {
     String::new()
 }
 
-fn filter_cargo_build(output: &str) -> String {
+fn filter_cargo_build(output: &str, verbose: u8) -> String {
     let mut handler = CargoBuildHandler::new();
     let mut blocks: Vec<Vec<String>> = Vec::new();
     let mut current_block: Vec<String> = Vec::new();
@@ -830,15 +838,16 @@ fn filter_cargo_build(output: &str) -> String {
         "cargo build: {} errors, {} warnings ({} crates)\n═══════════════════════════════════════\n",
         handler.error_count, handler.warnings, handler.compiled
     );
-    for (i, blk) in blocks.iter().enumerate().take(15) {
+    let max_blocks = if verbose > 0 { usize::MAX } else { 15 };
+    for (i, blk) in blocks.iter().enumerate().take(max_blocks) {
         result.push_str(&blk.join("\n"));
         result.push('\n');
         if i < blocks.len() - 1 {
             result.push('\n');
         }
     }
-    if blocks.len() > 15 {
-        result.push_str(&format!("\n... +{} more issues\n", blocks.len() - 15));
+    if blocks.len() > max_blocks {
+        result.push_str(&format!("\n... +{} more issues\n", blocks.len() - max_blocks));
     }
     result.trim().to_string()
 }
@@ -1051,7 +1060,7 @@ pub(crate) fn filter_cargo_test(output: &str) -> String {
         });
 
         if has_compile_errors {
-            let build_filtered = filter_cargo_build(output);
+            let build_filtered = filter_cargo_build(output, 0);
             if build_filtered.starts_with("cargo build:") {
                 return build_filtered.replacen("cargo build:", "cargo test:", 1);
             }
@@ -1071,7 +1080,7 @@ pub(crate) fn filter_cargo_test(output: &str) -> String {
 }
 
 /// Filter cargo clippy output - show full error blocks, group warnings by lint rule
-fn filter_cargo_clippy(output: &str) -> String {
+fn filter_cargo_clippy(output: &str, verbose: u8) -> String {
     let mut by_rule: HashMap<String, Vec<String>> = HashMap::new();
     let mut error_count = 0;
     let mut warning_count = 0;
@@ -1178,17 +1187,24 @@ fn filter_cargo_clippy(output: &str) -> String {
     ));
     result.push_str("═══════════════════════════════════════\n");
 
+    let max_error_blocks = if verbose > 0 { usize::MAX } else { 10 };
+    let max_rules = if verbose > 0 { usize::MAX } else { 15 };
+    let max_locs = if verbose > 0 { usize::MAX } else { 3 };
+
     // Show full error blocks so developers can see what needs fixing
     if !error_blocks.is_empty() {
         result.push_str("\nErrors:\n");
-        for block in error_blocks.iter().take(10) {
+        for block in error_blocks.iter().take(max_error_blocks) {
             for block_line in block {
                 result.push_str(&format!("  {}\n", truncate(block_line, 160)));
             }
             result.push('\n');
         }
-        if error_blocks.len() > 10 {
-            result.push_str(&format!("  ... +{} more errors\n", error_blocks.len() - 10));
+        if error_blocks.len() > max_error_blocks {
+            result.push_str(&format!(
+                "  ... +{} more errors\n",
+                error_blocks.len() - max_error_blocks
+            ));
         }
     }
 
@@ -1196,18 +1212,21 @@ fn filter_cargo_clippy(output: &str) -> String {
     let mut rule_counts: Vec<_> = by_rule.iter().collect();
     rule_counts.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
 
-    for (rule, locations) in rule_counts.iter().take(15) {
+    for (rule, locations) in rule_counts.iter().take(max_rules) {
         result.push_str(&format!("  {} ({}x)\n", rule, locations.len()));
-        for loc in locations.iter().take(3) {
+        for loc in locations.iter().take(max_locs) {
             result.push_str(&format!("    {}\n", loc));
         }
-        if locations.len() > 3 {
-            result.push_str(&format!("    ... +{} more\n", locations.len() - 3));
+        if locations.len() > max_locs {
+            result.push_str(&format!("    ... +{} more\n", locations.len() - max_locs));
         }
     }
 
-    if by_rule.len() > 15 {
-        result.push_str(&format!("\n... +{} more rules\n", by_rule.len() - 15));
+    if by_rule.len() > max_rules {
+        result.push_str(&format!(
+            "\n... +{} more rules\n",
+            by_rule.len() - max_rules
+        ));
     }
 
     result.trim().to_string()
@@ -1333,7 +1352,7 @@ mod tests {
    Compiling rtk v0.5.0
     Finished dev [unoptimized + debuginfo] target(s) in 15.23s
 "#;
-        let result = filter_cargo_build(output);
+        let result = filter_cargo_build(output, 0);
         assert!(result.contains("cargo build"));
         assert!(result.contains("3 crates compiled"));
     }
@@ -1349,7 +1368,7 @@ error[E0308]: mismatched types
 
 error: aborting due to 1 previous error
 "#;
-        let result = filter_cargo_build(output);
+        let result = filter_cargo_build(output, 0);
         assert!(result.contains("1 errors"));
         assert!(result.contains("E0308"));
         assert!(result.contains("mismatched types"));
@@ -1576,7 +1595,7 @@ error: could not compile `rtk` (test "repro_compile_fail") due to 1 previous err
         let output = r#"    Checking rtk v0.5.0
     Finished dev [unoptimized + debuginfo] target(s) in 1.53s
 "#;
-        let result = filter_cargo_clippy(output);
+        let result = filter_cargo_clippy(output, 0);
         assert!(result.contains("cargo clippy: No issues found"));
     }
 
@@ -1598,7 +1617,7 @@ warning: this function has too many arguments [clippy::too_many_arguments]
 warning: `rtk` (bin) generated 2 warnings
     Finished dev [unoptimized + debuginfo] target(s) in 1.53s
 "#;
-        let result = filter_cargo_clippy(output);
+        let result = filter_cargo_clippy(output, 0);
         assert!(result.contains("0 errors, 2 warnings"));
         assert!(result.contains("unused_variables"));
         assert!(result.contains("clippy::too_many_arguments"));
@@ -1611,7 +1630,7 @@ error: struct literals are not allowed here
 warning: unused variable: `x` [unused_variables]
     Finished dev [unoptimized + debuginfo] target(s) in 1.53s
 "#;
-        let result = filter_cargo_clippy(output);
+        let result = filter_cargo_clippy(output, 0);
         assert!(result.contains("cargo clippy: 1 errors, 1 warnings"));
         assert!(result.contains("Errors:"));
         assert!(result.contains("struct literals are not allowed here"));
@@ -1631,7 +1650,7 @@ error[E0308]: mismatched types
 
 error: aborting due to 1 previous error
 "#;
-        let result = filter_cargo_clippy(output);
+        let result = filter_cargo_clippy(output, 0);
         assert!(result.contains("cargo clippy: 1 errors, 0 warnings"), "got: {}", result);
         assert!(result.contains("error[E0308]: mismatched types"), "got: {}", result);
         assert!(result.contains("src/main.rs:10:5"), "got: {}", result);
@@ -1648,7 +1667,7 @@ error[E0425]: cannot find value `x`
 
 error: aborting due to 2 previous errors
 "#;
-        let result = filter_cargo_clippy(output);
+        let result = filter_cargo_clippy(output, 0);
         assert!(result.contains("2 errors"), "got: {}", result);
         assert!(result.contains("src/foo.rs:5:3"), "got: {}", result);
         assert!(result.contains("src/bar.rs:12:9"), "got: {}", result);
@@ -1669,7 +1688,7 @@ error: aborting due to 2 previous errors
   Replacing /Users/user/.cargo/bin/rtk
    Replaced package `rtk v0.9.4` with `rtk v0.11.0` (/Users/user/.cargo/bin/rtk)
 "#;
-        let result = filter_cargo_install(output);
+        let result = filter_cargo_install(output, 0);
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(result.contains("rtk v0.11.0"), "got: {}", result);
         assert!(result.contains("5 deps compiled"), "got: {}", result);
@@ -1686,7 +1705,7 @@ error: aborting due to 2 previous errors
   Replacing /Users/user/.cargo/bin/rtk
    Replaced package `rtk v0.9.4` with `rtk v0.11.0` (/Users/user/.cargo/bin/rtk)
 "#;
-        let result = filter_cargo_install(output);
+        let result = filter_cargo_install(output, 0);
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(result.contains("Replacing"), "got: {}", result);
         assert!(result.contains("Replaced"), "got: {}", result);
@@ -1704,7 +1723,7 @@ error[E0308]: mismatched types
 
 error: aborting due to 1 previous error
 "#;
-        let result = filter_cargo_install(output);
+        let result = filter_cargo_install(output, 0);
         assert!(result.contains("cargo install: 1 error"), "got: {}", result);
         assert!(result.contains("E0308"), "got: {}", result);
         assert!(result.contains("mismatched types"), "got: {}", result);
@@ -1715,7 +1734,7 @@ error: aborting due to 1 previous error
     fn test_filter_cargo_install_already_installed() {
         let output = r#"  Ignored package `rtk v0.11.0`, is already installed
 "#;
-        let result = filter_cargo_install(output);
+        let result = filter_cargo_install(output, 0);
         assert!(result.contains("already installed"), "got: {}", result);
         assert!(result.contains("rtk v0.11.0"), "got: {}", result);
     }
@@ -1724,14 +1743,14 @@ error: aborting due to 1 previous error
     fn test_filter_cargo_install_up_to_date() {
         let output = r#"  Ignored package `cargo-deb v2.1.0 (/Users/user/cargo-deb)`, is already installed
 "#;
-        let result = filter_cargo_install(output);
+        let result = filter_cargo_install(output, 0);
         assert!(result.contains("already installed"), "got: {}", result);
         assert!(result.contains("cargo-deb v2.1.0"), "got: {}", result);
     }
 
     #[test]
     fn test_filter_cargo_install_empty_output() {
-        let result = filter_cargo_install("");
+        let result = filter_cargo_install("", 0);
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(result.contains("0 deps compiled"), "got: {}", result);
     }
@@ -1745,7 +1764,7 @@ error: aborting due to 1 previous error
    Replaced package `rtk v0.9.4` with `rtk v0.11.0` (/Users/user/.cargo/bin/rtk)
 warning: be sure to add `/Users/user/.cargo/bin` to your PATH
 "#;
-        let result = filter_cargo_install(output);
+        let result = filter_cargo_install(output, 0);
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(
             result.contains("be sure to add"),
@@ -1773,7 +1792,7 @@ error[E0425]: cannot find value `foo`
 
 error: aborting due to 2 previous errors
 "#;
-        let result = filter_cargo_install(output);
+        let result = filter_cargo_install(output, 0);
         assert!(
             result.contains("2 errors"),
             "should show 2 errors: {}",
@@ -1795,7 +1814,7 @@ error: aborting due to 2 previous errors
     Finished `release` profile [optimized] target(s) in 30.0s
   Installing rtk v0.11.0
 "#;
-        let result = filter_cargo_install(output);
+        let result = filter_cargo_install(output, 0);
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(!result.contains("Locking"), "got: {}", result);
         assert!(!result.contains("Blocking"), "got: {}", result);
@@ -1808,7 +1827,7 @@ error: aborting due to 2 previous errors
    Compiling rtk v0.11.0
     Finished `release` profile [optimized] target(s) in 10.0s
 "#;
-        let result = filter_cargo_install(output);
+        let result = filter_cargo_install(output, 0);
         // Path-based install: crate info not extracted from path
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(result.contains("1 deps compiled"), "got: {}", result);
