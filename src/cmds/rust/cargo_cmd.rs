@@ -338,6 +338,20 @@ fn run_cargo_streamed(
     )
 }
 
+/// Append a hint suggesting `-v` when filter output was truncated.
+/// The wording explicitly defers the rerun decision to the caller -- only
+/// reach for `-v` if the elided content is actually needed.
+fn append_verbose_hint(text: String, truncated: bool, verbose: u8) -> String {
+    if truncated && verbose == 0 {
+        format!(
+            "{}\n\n[output truncated -- only rerun with -v if you need the elided details]",
+            text
+        )
+    } else {
+        text
+    }
+}
+
 fn run_build(args: &[String], verbose: u8) -> Result<i32> {
     run_cargo_streamed(
         "build",
@@ -358,22 +372,22 @@ fn run_test(args: &[String], verbose: u8) -> Result<i32> {
 
 fn run_clippy(args: &[String], verbose: u8) -> Result<i32> {
     run_cargo_filtered("clippy", args, verbose, move |raw| {
-        filter_cargo_clippy(raw, verbose)
+        let (text, truncated) = filter_cargo_diagnostics(raw, verbose, "cargo clippy");
+        append_verbose_hint(text, truncated, verbose)
     })
 }
 
 fn run_check(args: &[String], verbose: u8) -> Result<i32> {
-    run_cargo_streamed(
-        "check",
-        args,
-        verbose,
-        Box::new(BlockStreamFilter::new(CargoBuildHandler::new())),
-    )
+    run_cargo_filtered("check", args, verbose, move |raw| {
+        let (text, truncated) = filter_cargo_diagnostics(raw, verbose, "cargo check");
+        append_verbose_hint(text, truncated, verbose)
+    })
 }
 
 fn run_install(args: &[String], verbose: u8) -> Result<i32> {
     run_cargo_filtered("install", args, verbose, move |raw| {
-        filter_cargo_install(raw, verbose)
+        let (text, truncated) = filter_cargo_install(raw, verbose);
+        append_verbose_hint(text, truncated, verbose)
     })
 }
 
@@ -392,39 +406,32 @@ fn format_crate_info(name: &str, version: &str, fallback: &str) -> String {
     }
 }
 
-/// Filter cargo install output - strip dep compilation, keep installed/replaced/errors
-fn filter_cargo_install(output: &str, verbose: u8) -> String {
-    let mut errors: Vec<String> = Vec::new();
-    let mut error_count = 0;
+/// Filter cargo install output - extract install metadata, then delegate
+/// warning/error formatting to `filter_cargo_diagnostics` so the body matches
+/// `cargo check` / `cargo clippy`. PATH-advice warnings (single-line `warning:`
+/// lines with no `--> ` follow-up) are pulled out and shown after the body, so
+/// they don't inflate the diagnostic warning count.
+/// Returns `(text, truncated)` where `truncated` is true if diagnostics elided
+/// any output.
+fn filter_cargo_install(output: &str, verbose: u8) -> (String, bool) {
     let mut compiled = 0;
-    let mut in_error = false;
-    let mut current_error = Vec::new();
     let mut installed_crate = String::new();
     let mut installed_version = String::new();
     let mut replaced_lines: Vec<String> = Vec::new();
     let mut already_installed = false;
     let mut ignored_line = String::new();
+    let mut standalone_warnings: Vec<String> = Vec::new();
 
-    for line in output.lines() {
+    let raw_lines: Vec<&str> = output.lines().collect();
+
+    for (idx, line) in raw_lines.iter().enumerate() {
         let trimmed = line.trim_start();
 
-        // Strip noise: dep compilation, downloading, locking, etc.
         if trimmed.starts_with("Compiling") {
             compiled += 1;
             continue;
         }
-        if trimmed.starts_with("Downloading")
-            || trimmed.starts_with("Downloaded")
-            || trimmed.starts_with("Locking")
-            || trimmed.starts_with("Updating")
-            || trimmed.starts_with("Adding")
-            || trimmed.starts_with("Finished")
-            || trimmed.starts_with("Blocking waiting for file lock")
-        {
-            continue;
-        }
 
-        // Keep: Installing line (extract crate name + version)
         if trimmed.starts_with("Installing") {
             let rest = trimmed.strip_prefix("Installing").unwrap_or("").trim();
             if !rest.is_empty() && !rest.starts_with('/') {
@@ -438,7 +445,6 @@ fn filter_cargo_install(output: &str, verbose: u8) -> String {
             continue;
         }
 
-        // Keep: Installed line (extract crate + version if not already set)
         if trimmed.starts_with("Installed") {
             let rest = trimmed.strip_prefix("Installed").unwrap_or("").trim();
             if !rest.is_empty() && installed_crate.is_empty() {
@@ -451,118 +457,67 @@ fn filter_cargo_install(output: &str, verbose: u8) -> String {
             continue;
         }
 
-        // Keep: Replacing/Replaced lines
         if trimmed.starts_with("Replacing") || trimmed.starts_with("Replaced") {
             replaced_lines.push(trimmed.to_string());
             continue;
         }
 
-        // Keep: "Ignored package" (already up to date)
         if trimmed.starts_with("Ignored package") {
             already_installed = true;
             ignored_line = trimmed.to_string();
             continue;
         }
 
-        // Keep: actionable warnings (e.g., "be sure to add `/path` to your PATH")
-        // Skip summary lines like "warning: `crate` generated N warnings"
-        if line.starts_with("warning:") {
-            if !(line.contains("generated") && line.contains("warning")) {
-                replaced_lines.push(line.to_string());
-            }
-            continue;
-        }
-
-        // Detect error blocks
-        if line.starts_with("error[") || line.starts_with("error:") {
-            if line.contains("aborting due to") || line.contains("could not compile") {
-                continue;
-            }
-            if in_error && !current_error.is_empty() {
-                errors.push(current_error.join("\n"));
-                current_error.clear();
-            }
-            error_count += 1;
-            in_error = true;
-            current_error.push(line.to_string());
-        } else if in_error {
-            if line.trim().is_empty() && current_error.len() > 3 {
-                errors.push(current_error.join("\n"));
-                current_error.clear();
-                in_error = false;
-            } else {
-                current_error.push(line.to_string());
+        // Detect standalone warnings (e.g. "be sure to add /path to your PATH"):
+        // a `warning:` line whose next non-blank line is NOT a `--> ` location.
+        if line.starts_with("warning:")
+            && !(line.contains("generated") && line.contains("warning"))
+        {
+            let next = raw_lines[idx + 1..].iter().find(|l| !l.trim().is_empty());
+            if next.is_none_or(|l| !l.trim_start().starts_with("-->")) {
+                standalone_warnings.push(line.to_string());
             }
         }
-    }
-
-    if !current_error.is_empty() {
-        errors.push(current_error.join("\n"));
     }
 
     // Already installed / up to date
     if already_installed {
         let info = ignored_line.split('`').nth(1).unwrap_or(&ignored_line);
-        return format!("cargo install: {} already installed", info);
+        return (format!("cargo install: {} already installed", info), false);
     }
 
-    // Errors
-    if error_count > 0 {
-        let crate_info = format_crate_info(&installed_crate, &installed_version, "");
-        let deps_info = if compiled > 0 {
-            format!(", {} deps compiled", compiled)
-        } else {
-            String::new()
-        };
-
-        let mut result = String::new();
-        if crate_info.is_empty() {
-            result.push_str(&format!(
-                "cargo install: {} error{}{}\n",
-                error_count,
-                if error_count > 1 { "s" } else { "" },
-                deps_info
-            ));
-        } else {
-            result.push_str(&format!(
-                "cargo install: {} error{} ({}{})\n",
-                error_count,
-                if error_count > 1 { "s" } else { "" },
-                crate_info,
-                deps_info
-            ));
-        }
-        result.push_str("═══════════════════════════════════════\n");
-
-        let max_errors = if verbose > 0 { usize::MAX } else { 15 };
-        for (i, err) in errors.iter().enumerate().take(max_errors) {
-            result.push_str(err);
-            result.push('\n');
-            if i < errors.len() - 1 {
-                result.push('\n');
-            }
-        }
-
-        if errors.len() > max_errors {
-            result.push_str(&format!(
-                "\n... +{} more issues\n",
-                errors.len() - max_errors
-            ));
-        }
-
-        return result.trim().to_string();
-    }
-
-    // Success
     let crate_info = format_crate_info(&installed_crate, &installed_version, "package");
+    let header_label = format!("cargo install ({}, {} deps compiled)", crate_info, compiled);
 
-    let mut result = format!("cargo install ({}, {} deps compiled)", crate_info, compiled);
+    // Strip standalone warnings before delegating, so they don't inflate the
+    // diagnostic count without contributing a body.
+    let cleaned: String = if standalone_warnings.is_empty() {
+        output.to_string()
+    } else {
+        raw_lines
+            .iter()
+            .filter(|l| !standalone_warnings.iter().any(|w| w == *l))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
 
+    let (diag_body, truncated) = filter_cargo_diagnostics(&cleaned, verbose, &header_label);
+
+    let mut result = if diag_body.ends_with(": No issues found") {
+        header_label
+    } else {
+        diag_body
+    };
+
+    for adv in &standalone_warnings {
+        result.push_str(&format!("\n  {}", adv));
+    }
     for line in &replaced_lines {
         result.push_str(&format!("\n  {}", line));
     }
 
-    result
+    (result, truncated)
 }
 
 /// Push a completed failure block (header + body) into the failures list, then clear the buffers.
@@ -1079,8 +1034,11 @@ pub(crate) fn filter_cargo_test(output: &str) -> String {
     result.trim().to_string()
 }
 
-/// Filter cargo clippy output - show full error blocks, group warnings by lint rule
-fn filter_cargo_clippy(output: &str, verbose: u8) -> String {
+/// Filter cargo diagnostic output (clippy/check) - show full error blocks,
+/// group warnings by lint rule. `tool` is the label used in the summary header
+/// (e.g. "cargo clippy" or "cargo check"). Returns `(text, truncated)` where
+/// `truncated` is true if any output was elided due to the default caps.
+fn filter_cargo_diagnostics(output: &str, verbose: u8, tool: &str) -> (String, bool) {
     let mut by_rule: HashMap<String, Vec<String>> = HashMap::new();
     let mut error_count = 0;
     let mut warning_count = 0;
@@ -1177,13 +1135,14 @@ fn filter_cargo_clippy(output: &str, verbose: u8) -> String {
     }
 
     if error_count == 0 && warning_count == 0 {
-        return "cargo clippy: No issues found".to_string();
+        return (format!("{}: No issues found", tool), false);
     }
 
+    let mut truncated = false;
     let mut result = String::new();
     result.push_str(&format!(
-        "cargo clippy: {} errors, {} warnings\n",
-        error_count, warning_count
+        "{}: {} errors, {} warnings\n",
+        tool, error_count, warning_count
     ));
     result.push_str("═══════════════════════════════════════\n");
 
@@ -1201,6 +1160,7 @@ fn filter_cargo_clippy(output: &str, verbose: u8) -> String {
             result.push('\n');
         }
         if error_blocks.len() > max_error_blocks {
+            truncated = true;
             result.push_str(&format!(
                 "  ... +{} more errors\n",
                 error_blocks.len() - max_error_blocks
@@ -1218,18 +1178,20 @@ fn filter_cargo_clippy(output: &str, verbose: u8) -> String {
             result.push_str(&format!("    {}\n", loc));
         }
         if locations.len() > max_locs {
+            truncated = true;
             result.push_str(&format!("    ... +{} more\n", locations.len() - max_locs));
         }
     }
 
     if by_rule.len() > max_rules {
+        truncated = true;
         result.push_str(&format!(
             "\n... +{} more rules\n",
             by_rule.len() - max_rules
         ));
     }
 
-    result.trim().to_string()
+    (result.trim().to_string(), truncated)
 }
 
 pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
@@ -1595,7 +1557,7 @@ error: could not compile `rtk` (test "repro_compile_fail") due to 1 previous err
         let output = r#"    Checking rtk v0.5.0
     Finished dev [unoptimized + debuginfo] target(s) in 1.53s
 "#;
-        let result = filter_cargo_clippy(output, 0);
+        let (result, _) = filter_cargo_diagnostics(output, 0, "cargo clippy");
         assert!(result.contains("cargo clippy: No issues found"));
     }
 
@@ -1617,7 +1579,7 @@ warning: this function has too many arguments [clippy::too_many_arguments]
 warning: `rtk` (bin) generated 2 warnings
     Finished dev [unoptimized + debuginfo] target(s) in 1.53s
 "#;
-        let result = filter_cargo_clippy(output, 0);
+        let (result, _) = filter_cargo_diagnostics(output, 0, "cargo clippy");
         assert!(result.contains("0 errors, 2 warnings"));
         assert!(result.contains("unused_variables"));
         assert!(result.contains("clippy::too_many_arguments"));
@@ -1630,7 +1592,7 @@ error: struct literals are not allowed here
 warning: unused variable: `x` [unused_variables]
     Finished dev [unoptimized + debuginfo] target(s) in 1.53s
 "#;
-        let result = filter_cargo_clippy(output, 0);
+        let (result, _) = filter_cargo_diagnostics(output, 0, "cargo clippy");
         assert!(result.contains("cargo clippy: 1 errors, 1 warnings"));
         assert!(result.contains("Errors:"));
         assert!(result.contains("struct literals are not allowed here"));
@@ -1650,7 +1612,7 @@ error[E0308]: mismatched types
 
 error: aborting due to 1 previous error
 "#;
-        let result = filter_cargo_clippy(output, 0);
+        let (result, _) = filter_cargo_diagnostics(output, 0, "cargo clippy");
         assert!(result.contains("cargo clippy: 1 errors, 0 warnings"), "got: {}", result);
         assert!(result.contains("error[E0308]: mismatched types"), "got: {}", result);
         assert!(result.contains("src/main.rs:10:5"), "got: {}", result);
@@ -1667,10 +1629,78 @@ error[E0425]: cannot find value `x`
 
 error: aborting due to 2 previous errors
 "#;
-        let result = filter_cargo_clippy(output, 0);
+        let (result, _) = filter_cargo_diagnostics(output, 0, "cargo clippy");
         assert!(result.contains("2 errors"), "got: {}", result);
         assert!(result.contains("src/foo.rs:5:3"), "got: {}", result);
         assert!(result.contains("src/bar.rs:12:9"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_filter_cargo_check_clean() {
+        let output = r#"    Checking rtk v0.5.0
+    Finished dev [unoptimized + debuginfo] target(s) in 1.53s
+"#;
+        let (result, _) = filter_cargo_diagnostics(output, 0, "cargo check");
+        assert!(result.contains("cargo check: No issues found"));
+    }
+
+    #[test]
+    fn test_filter_cargo_check_errors() {
+        let output = r#"    Checking rtk v0.5.0
+error[E0308]: mismatched types
+ --> src/main.rs:10:5
+  |
+10|     "hello"
+  |     ^^^^^^^ expected `i32`, found `&str`
+
+error: aborting due to 1 previous error
+"#;
+        let (result, _) = filter_cargo_diagnostics(output, 0, "cargo check");
+        assert!(
+            result.contains("cargo check: 1 errors, 0 warnings"),
+            "got: {}",
+            result
+        );
+        assert!(result.contains("error[E0308]: mismatched types"), "got: {}", result);
+        assert!(result.contains("src/main.rs:10:5"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_filter_cargo_diagnostics_truncation_flag() {
+        // 16 distinct rules > max_rules cap of 15 -> truncated.
+        let mut input = String::from("    Checking rtk v0.5.0\n");
+        for i in 0..16 {
+            input.push_str(&format!(
+                "warning: lint message [rule_{}]\n --> src/lib.rs:{}:1\n\n",
+                i,
+                i + 1
+            ));
+        }
+        let (text, truncated) = filter_cargo_diagnostics(&input, 0, "cargo clippy");
+        assert!(truncated, "expected truncated=true, got text: {}", text);
+        assert!(text.contains("more rules"), "got: {}", text);
+
+        let hinted = append_verbose_hint(text, truncated, 0);
+        assert!(hinted.contains("rerun with -v"), "got: {}", hinted);
+    }
+
+    #[test]
+    fn test_filter_cargo_diagnostics_verbose_no_truncation() {
+        // Same 16 rules, but verbose=1 disables caps -> never truncated.
+        let mut input = String::from("    Checking rtk v0.5.0\n");
+        for i in 0..16 {
+            input.push_str(&format!(
+                "warning: lint message [rule_{}]\n --> src/lib.rs:{}:1\n\n",
+                i,
+                i + 1
+            ));
+        }
+        let (text, truncated) = filter_cargo_diagnostics(&input, 1, "cargo clippy");
+        assert!(!truncated, "expected truncated=false in verbose mode");
+        assert!(!text.contains("more rules"), "got: {}", text);
+
+        let hinted = append_verbose_hint(text, truncated, 1);
+        assert!(!hinted.contains("rerun with -v"), "got: {}", hinted);
     }
 
     #[test]
@@ -1688,7 +1718,7 @@ error: aborting due to 2 previous errors
   Replacing /Users/user/.cargo/bin/rtk
    Replaced package `rtk v0.9.4` with `rtk v0.11.0` (/Users/user/.cargo/bin/rtk)
 "#;
-        let result = filter_cargo_install(output, 0);
+        let (result, _) = filter_cargo_install(output, 0);
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(result.contains("rtk v0.11.0"), "got: {}", result);
         assert!(result.contains("5 deps compiled"), "got: {}", result);
@@ -1705,7 +1735,7 @@ error: aborting due to 2 previous errors
   Replacing /Users/user/.cargo/bin/rtk
    Replaced package `rtk v0.9.4` with `rtk v0.11.0` (/Users/user/.cargo/bin/rtk)
 "#;
-        let result = filter_cargo_install(output, 0);
+        let (result, _) = filter_cargo_install(output, 0);
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(result.contains("Replacing"), "got: {}", result);
         assert!(result.contains("Replaced"), "got: {}", result);
@@ -1723,8 +1753,9 @@ error[E0308]: mismatched types
 
 error: aborting due to 1 previous error
 "#;
-        let result = filter_cargo_install(output, 0);
-        assert!(result.contains("cargo install: 1 error"), "got: {}", result);
+        let (result, _) = filter_cargo_install(output, 0);
+        assert!(result.contains("cargo install"), "got: {}", result);
+        assert!(result.contains("1 errors"), "got: {}", result);
         assert!(result.contains("E0308"), "got: {}", result);
         assert!(result.contains("mismatched types"), "got: {}", result);
         assert!(!result.contains("aborting"), "got: {}", result);
@@ -1734,7 +1765,7 @@ error: aborting due to 1 previous error
     fn test_filter_cargo_install_already_installed() {
         let output = r#"  Ignored package `rtk v0.11.0`, is already installed
 "#;
-        let result = filter_cargo_install(output, 0);
+        let (result, _) = filter_cargo_install(output, 0);
         assert!(result.contains("already installed"), "got: {}", result);
         assert!(result.contains("rtk v0.11.0"), "got: {}", result);
     }
@@ -1743,16 +1774,60 @@ error: aborting due to 1 previous error
     fn test_filter_cargo_install_up_to_date() {
         let output = r#"  Ignored package `cargo-deb v2.1.0 (/Users/user/cargo-deb)`, is already installed
 "#;
-        let result = filter_cargo_install(output, 0);
+        let (result, _) = filter_cargo_install(output, 0);
         assert!(result.contains("already installed"), "got: {}", result);
         assert!(result.contains("cargo-deb v2.1.0"), "got: {}", result);
     }
 
     #[test]
     fn test_filter_cargo_install_empty_output() {
-        let result = filter_cargo_install("", 0);
+        let (result, _) = filter_cargo_install("", 0);
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(result.contains("0 deps compiled"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_filter_cargo_install_warning_keeps_location() {
+        let output = r#"  Installing rtk v0.11.0
+   Compiling rtk v0.11.0
+warning: unused variable: `e`
+  --> src/cmds/rust/cargo_cmd.rs:42:13
+   |
+42 |     let e = compute();
+   |         ^ help: if this is intentional, prefix it with an underscore: `_e`
+
+warning: associated function `new` is never used
+  --> src/core/stream.rs:95:12
+   |
+95 |     pub fn new(...) -> Self {
+   |            ^^^
+
+warning: `rtk` (bin) generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 1.0s
+  Replacing /Users/u/.cargo/bin/rtk
+   Replaced package `rtk v0.11.0` with `rtk v0.11.0` (executable `rtk`)
+"#;
+        let (result, _) = filter_cargo_install(output, 0);
+        assert!(
+            result.contains("unused variable: `e`"),
+            "warning headline missing: {}",
+            result
+        );
+        assert!(
+            result.contains("src/cmds/rust/cargo_cmd.rs:42:13"),
+            "first warning location missing: {}",
+            result
+        );
+        assert!(
+            result.contains("src/core/stream.rs:95:12"),
+            "second warning location missing: {}",
+            result
+        );
+        assert!(
+            !result.contains("generated 2 warnings"),
+            "summary line should be skipped: {}",
+            result
+        );
     }
 
     #[test]
@@ -1764,7 +1839,7 @@ error: aborting due to 1 previous error
    Replaced package `rtk v0.9.4` with `rtk v0.11.0` (/Users/user/.cargo/bin/rtk)
 warning: be sure to add `/Users/user/.cargo/bin` to your PATH
 "#;
-        let result = filter_cargo_install(output, 0);
+        let (result, _) = filter_cargo_install(output, 0);
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(
             result.contains("be sure to add"),
@@ -1792,7 +1867,7 @@ error[E0425]: cannot find value `foo`
 
 error: aborting due to 2 previous errors
 "#;
-        let result = filter_cargo_install(output, 0);
+        let (result, _) = filter_cargo_install(output, 0);
         assert!(
             result.contains("2 errors"),
             "should show 2 errors: {}",
@@ -1814,7 +1889,7 @@ error: aborting due to 2 previous errors
     Finished `release` profile [optimized] target(s) in 30.0s
   Installing rtk v0.11.0
 "#;
-        let result = filter_cargo_install(output, 0);
+        let (result, _) = filter_cargo_install(output, 0);
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(!result.contains("Locking"), "got: {}", result);
         assert!(!result.contains("Blocking"), "got: {}", result);
@@ -1827,7 +1902,7 @@ error: aborting due to 2 previous errors
    Compiling rtk v0.11.0
     Finished `release` profile [optimized] target(s) in 10.0s
 "#;
-        let result = filter_cargo_install(output, 0);
+        let (result, _) = filter_cargo_install(output, 0);
         // Path-based install: crate info not extracted from path
         assert!(result.contains("cargo install"), "got: {}", result);
         assert!(result.contains("1 deps compiled"), "got: {}", result);
